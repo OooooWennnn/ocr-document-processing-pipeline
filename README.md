@@ -7,6 +7,61 @@ with the source and correct it without switching between separate forms.
 The project runs locally with Docker Compose. Next.js provides the editor,
 FastAPI handles uploads and edits, and a Celery worker runs PaddleOCR on the CPU.
 
+## Preview
+
+<p align="center">
+  <img src="docs/images/main_page.png" alt="Main page" width="800"/>
+  <br />
+  <em>Main page — Select and upload an image or PDF.</em>
+</p>
+<br />
+
+<p align="center">
+  <img src="docs/images/result.png" alt="OCR result" width="800"/>
+  <br />
+  <em>Result Page - Displays OCR result and confidence scores.</em>
+</p>
+<br />
+
+<p align="center">
+  <img src="docs/images/edit.png" alt="Edit result" width="800"/>
+  <br />
+  <em>Edit Result - Select inaccurate or low confidence field and edit.</em>
+</p>
+<br />
+
+<details>
+  <summary>More Screenshots</summary>
+
+  <p align="center">
+    <img src="docs/images/uploaded.png" alt="Image uploaded" width="800"/>
+    <br />
+    <em>Image Uploaded - Shows the uploaded original image.</em>
+  </p>
+  <br />
+
+  <p align="center">
+    <img src="docs/images/processing.png" alt="OCR processing" width="800"/>
+    <br />
+    <em>Processing Page - User receives Job # and workers process OCR.</em>
+  </p>
+  <br />
+
+  <p align="center">
+    <img src="docs/images/export_html.png" alt="HTML export" width="800"/>
+    <br />
+    <em>HTML Export - Exported HTML.</em>
+  </p>
+  <br />
+
+  <p align="center">
+    <img src="docs/images/export_json.png" alt="JSON export" width="800"/>
+    <br />
+    <em>JSON Export - Exported JSON.</em>
+  </p>
+  <br />
+</details>
+
 ## Features
 
 - Extract page text and multiple tables, including merged cells and empty cells
@@ -77,22 +132,22 @@ and Redis addresses, passes settings to the API and worker, and supplies
 For an existing database volume, use its current password. Changing `.env` alone
 does not change the database user's password.
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `POSTGRES_PASSWORD` | Required | Local database password; replace the template placeholder |
-| `FRONTEND_PORT` / `BACKEND_PORT` | `3000` / `8000` | Browser-facing ports |
-| `POSTGRES_PORT` / `REDIS_PORT` | `5432` / `63797` | Local database and queue ports |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | API address used by the browser |
-| `OCR_LANGUAGE` | `korean` | Recognition language; use `en` for English documents |
-| `OCR_WARMUP` | `1` | Load the model after worker startup; `0` loads it on the first job |
-| `OCR_CPU_THREADS` | `4` | CPU threads used by the model |
-| `OCR_RECOGNITION_BATCH_SIZE` | `4` | Text crops recognized together |
-| `OCR_DETECTION_SIZE` | `2048` | Maximum long side for text detection |
-| `OCR_DETECTION_MAX_PIXELS` | `1000000` | Pixel budget for the text detector |
-| `OCR_UPSCALE_TARGET` | `1600` | Target long side for small inputs, with at most 2× upscaling |
-| `OCR_REFINE_MAX_CROPS` | `64` | Maximum crops considered for targeted re-recognition |
-| `OCR_WORKER_MEMORY_LIMIT` | `7g` | Worker container memory limit |
-| `OCR_TASK_TIME_LIMIT` | `5400` | Soft document timeout in seconds; the hard limit follows 60 seconds later |
+| Setting                          | Default                 | Purpose                                                                   |
+| -------------------------------- | ----------------------- | ------------------------------------------------------------------------- |
+| `POSTGRES_PASSWORD`              | Required                | Local database password; replace the template placeholder                 |
+| `FRONTEND_PORT` / `BACKEND_PORT` | `3000` / `8000`         | Browser-facing ports                                                      |
+| `POSTGRES_PORT` / `REDIS_PORT`   | `5432` / `63797`        | Local database and queue ports                                            |
+| `NEXT_PUBLIC_API_URL`            | `http://localhost:8000` | API address used by the browser                                           |
+| `OCR_LANGUAGE`                   | `korean`                | Recognition language; use `en` for English documents                      |
+| `OCR_WARMUP`                     | `1`                     | Load the model after worker startup; `0` loads it on the first job        |
+| `OCR_CPU_THREADS`                | `4`                     | CPU threads used by the model                                             |
+| `OCR_RECOGNITION_BATCH_SIZE`     | `4`                     | Text crops recognized together                                            |
+| `OCR_DETECTION_SIZE`             | `2048`                  | Maximum long side for text detection                                      |
+| `OCR_DETECTION_MAX_PIXELS`       | `1000000`               | Pixel budget for the text detector                                        |
+| `OCR_UPSCALE_TARGET`             | `1600`                  | Target long side for small inputs, with at most 2× upscaling              |
+| `OCR_REFINE_MAX_CROPS`           | `64`                    | Maximum crops considered for targeted re-recognition                      |
+| `OCR_WORKER_MEMORY_LIMIT`        | `7g`                    | Worker container memory limit                                             |
+| `OCR_TASK_TIME_LIMIT`            | `5400`                  | Soft document timeout in seconds; the hard limit follows 60 seconds later |
 
 After changing `.env`, run `docker compose up -d --build` again. The browser API
 address is baked into the frontend build, so a restart alone will not update it.
@@ -129,20 +184,20 @@ tries to record the job as failed.
 
 ```text
 backend/
-  main.py                  FastAPI app and database initialization
-  src/api/v1/endpoints/    Upload, result, preview and edit endpoints
-  src/models/             PostgreSQL table definitions
-  src/core/               Celery configuration
-  src/services/           Document input, OCR, geometry, mapping and edits
-  src/tasks/              Model reuse, job execution and interruption handling
-  tests/                  Automated checks
+  main.py                   FastAPI app and database initialization
+  src/api/v1/endpoints/     Upload, result, preview and edit endpoints
+  src/models/               PostgreSQL table definitions
+  src/core/                 Celery configuration
+  src/services/             Document input, OCR, geometry, mapping and edits
+  src/tasks/                Model reuse, job execution and interruption handling
+  tests/                    Automated checks
 frontend/
-  app/                    Pages and styles
-  components/ocr/          Upload and document editor
-  hooks/                  Upload state and result polling
-  lib/                    API types, requests and exports
-docker-compose.yml        Local services and shared storage
-.env.example              Compose configuration template
+  app/                      Pages and styles
+  components/ocr/           Upload and document editor
+  hooks/                    Upload state and result polling
+  lib/                      API types, requests and exports
+docker-compose.yml          Local services and shared storage
+.env.example                Compose configuration template
 ```
 
 `requirements.docker.txt` defines the API dependencies. The worker adds
@@ -155,11 +210,11 @@ in `services/` depend on these versions, so check them when upgrading.
 PostgreSQL stores job metadata and JSONB results. Uploaded files and PDF page
 previews live in `./storage`, shared by the API and worker.
 
-| Field | Contents |
-| --- | --- |
-| `raw_json` | Model output and preprocessing details |
+| Field         | Contents                                     |
+| ------------- | -------------------------------------------- |
+| `raw_json`    | Model output and preprocessing details       |
 | `result_json` | Original extracted document, grouped by page |
-| `edited_json` | Saved user edits applied to the document |
+| `edited_json` | Saved user edits applied to the document     |
 
 Database, Redis and model caches use named Docker volumes. `docker compose down`
 stops the stack without removing them. Adding `-v` deletes those volumes, including
