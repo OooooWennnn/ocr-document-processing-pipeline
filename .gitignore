@@ -3,6 +3,7 @@
 !.env.example
 
 .venv/
+.venv*
 venv/
 __pycache__/
 *.py[cod]
@@ -15,7 +16,7 @@ dist/
 .vite/
 
 uploads/
-backend/outputs/
+backend/output/
 backend/db/
 results/
 private-data/
@@ -25,7 +26,7 @@ logs/
 *.db
 *.sqlite3
 
-models/
+/models/
 model-cache/
 .paddleocr/
 .paddlex/
@@ -39,4 +40,4 @@ model-cache/
 
 .data/
 storage/
-frontend/
+.editorconfig

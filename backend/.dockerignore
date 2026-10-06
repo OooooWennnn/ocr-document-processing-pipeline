@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!requirements.docker.txt
+!requirements.ocr.txt
+!main.py
+!src/
+!src/**
+!tests/
+!tests/**
+**/__pycache__
+**/*.pyc

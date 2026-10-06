@@ -1,216 +1,228 @@
-from fastapi import APIRouter, UploadFile, HTTPException, Depends
-import numpy as np
-import cv2
-import math
-from pathlib import Path
-from sqlmodel import select, Session
+"""Document uploads, job status, source previews and saved edits."""
 
-# from src.services.table_extraction import TableExtraction
-from ....db.session import get_session
-from ....models.job_model import Job, JobResult, JobStatus
-from ....util import now_toronto
+import os
+from io import BytesIO
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pathlib import Path
+from uuid import uuid4
+
+import cv2
+import numpy as np
+from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from pydantic import BaseModel, Field, ConfigDict
+from sqlmodel import Session, select
+
+from src.db.session import get_session
+from src.models.job_model import Job, JobResult, JobStatus
+from src.services.result_editing import apply_document_edits, present_document
 from src.tasks.ocr_tasks import process_job
+from src.util import now_toronto
+from src.services.document_input import validate_pdf, preview_path, resolve_source_path
 
 router = APIRouter()
+MAX_BYTES = 50 * 1024 * 1024
 
-def get_grid_boundaries(cells):
-    # consolidate all x_min and x_max and sort them
-    x_lines = []
-    for c in cells:
-        bbox = c["bbox"]
-        x_lines.append(bbox["x_max"])
-        x_lines.append(bbox["x_min"])
+MAX_PIXELS = 25_000_000
+STORAGE_ROOT = Path(os.getenv("OCR_STORAGE_DIR", str(Path(__file__).resolve().parents[5] / "storage"))).expanduser().resolve()
 
-    # consolidate all y_min and y_max and sort them
-    y_lines = []
-    for c in cells:
-        bbox = c["bbox"]
-        y_lines.append(bbox["y_max"])
-        y_lines.append(bbox["y_min"])
 
-    return merge_lines(x_lines), merge_lines(y_lines)
+class CellEdit(BaseModel):
+    """A row, column and replacement value for legacy table edits."""
+    model_config = ConfigDict(extra="forbid")
+    row: int = Field(ge=0)
+    col: int = Field(ge=0)
+    value: str = Field(max_length=10000)
 
-def merge_lines(lines, tolerance=3):
-    if not lines:
-        return []
-    
-    lines.sort()
-    merged = [lines[0]]
-    
-    for val in lines[1:]:
-        if abs(val - merged[-1]) > tolerance:
-            merged.append(val)
 
-    return merged
+class TextEdit(BaseModel):
+    """A region ID and replacement text."""
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(max_length=100)
+    value: str = Field(max_length=10000)
 
-@router.get("/{job_id}", tags=["jobs"], status_code=200)
-async def get_job(job_id: int, session: Session = Depends(get_session)):
+
+class PageRegionEdit(BaseModel):
+    """Edits for one page, using a zero-based page index."""
+    model_config = ConfigDict(extra="forbid")
+    page_index: int = Field(ge=0)
+    regions: list[TextEdit] = Field(min_length=1, max_length=10000)
+
+
+class ResultEdit(BaseModel):
+    """Validate edit payloads; pages is current, cells/texts support older clients."""
+    model_config = ConfigDict(extra="forbid")
+    page_index: int = Field(default=0, ge=0)
+    table_id: str | None = None
+    cells: list[CellEdit] = Field(default_factory=list, max_length=10000)
+    texts: list[TextEdit] = Field(default_factory=list, max_length=10000)
+    regions: list[TextEdit] = Field(default_factory=list, max_length=10000)
+    pages: list[PageRegionEdit] = Field(default_factory=list, max_length=30)
+
+
+def get_job_or_404(session, job_id):
+    """Find a job by its primary key or raise HTTP 404."""
     job = session.get(Job, job_id)
 
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    if job is None:
+        raise HTTPException(404, "Job not found.")
+
     return job
 
-@router.get("/{job_id}/result", tags=["jobs"])
-async def get_result(job_id: int, session: Session = Depends(get_session)):
 
-    # 1. 일단 대빵(Job) 테이블부터 조회해서 현재 진짜 상태를 가져옴
-    job = session.get(Job, job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job itself not found")
+def get_result_or_404(session, job_id):
+    """Find the latest result by job_id or raise HTTP 404."""
+    result = session.exec(select(JobResult).where(JobResult.job_id == job_id).order_by(JobResult.id.desc())).first()
 
-    # 2. 작업이 아직 안 끝났거나 실패했다면, 테이블 결과 파싱할 필요 없이 바로 상태만 리턴
-    if job.status != JobStatus.done:
-        return {
-            "status": job.status, # "queued", "processing", "failed" 등 진짜 상태 전달
-            "message": job.error_message if job.status == JobStatus.failed else "Processing..."
-        }
-    
-    # result == {1 table}
-    # TODO: 2 or more table in array
-    data = session.exec(select(JobResult).where(JobResult.job_id == job_id)).first()
+    if result is None:
+        raise HTTPException(404, "Saved result not found.")
 
-    if not data:
-        raise HTTPException(status_code=404, detail="Result not found")
-    
-    result = data.result_json
+    return result
 
-    if not result:
-        raise HTTPException(status_code=404, detail="Parsed result not found")
-    
-    cells = [cell for row in result["table_rows"] for cell in row["cells"]]
 
-    x_lines, y_lines = get_grid_boundaries(cells)
-    
-    # Takes care of only 1 table, TODO: imporve so it takes care of 2 or more tables
-    front_res = {
-        "status": job.status,
-        "tables": [
-            {
-                "id": result["id"],
-                "bbox": result["bbox"],
-                "x_lines": x_lines,
-                "y_lines": y_lines,
-                "cells": [
-                    {
-                        "row": cell["row"],
-                        "col": cell["col"],
-                        "rowspan": cell["rowspan"],
-                        "colspan": cell["colspan"],
-                        "value": " ".join(text["value"] for text in cell["texts"]) if cell["texts"] else "",
-                        "score": min(text["score"] for text in cell["texts"]) if cell["texts"] else None,
-                        "bbox": cell["bbox"]
-                    }
-                    for row in result["table_rows"]
-                    for cell in row["cells"]
-                ]
-            }
-        ]
-    }
+@router.get("/{job_id}")
+def get_job(job_id: int, session: Session = Depends(get_session)):
+    """Return job metadata, status and any error message."""
+    return get_job_or_404(session, job_id)
 
-    return front_res    
 
-@router.post("/", tags=["jobs"], status_code=201)
+@router.get("/{job_id}/image")
+def get_image(job_id: int, page_index: int = 0, session: Session = Depends(get_session)):
+    """Return the source image or a zero-based PDF page preview; missing previews raise 404."""
+    job = get_job_or_404(session, job_id)
+
+    if not 0 <= page_index < (job.page_count or 1):
+        raise HTTPException(404, "Page not found.")
+
+    source = resolve_source_path(job.file_path) if job.file_path else Path("")
+    path = source
+
+    if job.file_path and job.file_type == "application/pdf":
+        path = preview_path(source, page_index)
+
+    if not path.is_file():
+        raise HTTPException(404, "Page preview is not available yet.")
+
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "private, no-store"})
+
+
+@router.get("/{job_id}/result")
+def get_result(job_id: int, session: Session = Depends(get_session)):
+    """Return saved edits before OCR originals, with job status and page progress."""
+    job = get_job_or_404(session, job_id)
+    data = session.exec(select(JobResult).where(JobResult.job_id == job_id).order_by(JobResult.id.desc())).first()
+    payload = {}
+
+    if data and data.result_json:
+        saved_result = data.edited_json if data.edited_json is not None else data.result_json
+        payload = present_document(saved_result)
+
+    return {**payload, "status": job.status, "message": job.error_message, "page_count": job.page_count or 1}
+
+
+@router.post("/", status_code=201)
 async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
-    content = await file.read()
-    filename = file.filename
-    file_type = file.content_type
-    print(file)
+    """Validate and save a document, create its job and queue the ID. OCR runs separately."""
+    content = await file.read(MAX_BYTES + 1)
 
-    # create job instance
-    job = Job(
-        original_filename = filename,
-        file_type = file_type,
-    )
+    await file.close()
 
-    # add job to db
-    # session = next(get_session()) # use next() due to Generator used 
-    session.add(job)
+    if not content or len(content) > MAX_BYTES:
+        raise HTTPException(413, "Choose a non-empty document of up to 50 MB.")
+
+    is_pdf = content.startswith(b"%PDF-")
+    page_count = 1
+    extension = ".pdf" if is_pdf else ".png"
+    destination = STORAGE_ROOT / "uploads" / f"{uuid4().hex}{extension}"
+    image = None
+
+    if is_pdf:
+        try:
+            page_count = validate_pdf(content)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+    else:
+        if not (content.startswith(b"\x89PNG\r\n\x1a\n") or content.startswith(b"\xff\xd8\xff")):
+            raise HTTPException(415, "Only PNG, JPEG and PDF documents are supported.")
+
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(413, "Images must be 10 MB or smaller.")
+
+        try:
+            with Image.open(BytesIO(content)) as source:
+                if source.width * source.height > MAX_PIXELS:
+                    raise HTTPException(413, "Reduce the image to 25 million pixels or fewer.")
+
+                source.verify()
+
+            with Image.open(BytesIO(content)) as source:
+                upright = ImageOps.exif_transpose(source).convert("RGBA")
+                normalized = Image.alpha_composite(Image.new("RGBA", upright.size, "white"), upright).convert("RGB")
+                image = cv2.cvtColor(np.asarray(normalized), cv2.COLOR_RGB2BGR)
+        except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
+            raise HTTPException(422, "The image could not be read.")
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        if is_pdf:
+            destination.write_bytes(content)
+        elif not cv2.imwrite(str(destination), image):
+            raise OSError("image write failed")
+
+        job_data = {
+            "original_filename": file.filename or "image",
+            "file_type": "application/pdf" if is_pdf else "image/png",
+            "file_path": str(destination),
+            "page_count": page_count,
+            "status": JobStatus.queued,
+        }
+        job = Job(**job_data)
+
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+    except Exception:
+        session.rollback()
+        destination.unlink(missing_ok=True)
+        raise HTTPException(500, "The document could not be saved.")
+
+    try:
+        process_job.delay(job.id)
+    except Exception:
+        job.status = JobStatus.failed
+        job.error_message = "The processing queue is unavailable. Please try uploading again shortly."
+        job.updated_at = now_toronto()
+
+        session.add(job)
+        session.commit()
+        raise HTTPException(503, job.error_message)
+
+    return {"job_id": job.id, "status": job.status}
+
+
+@router.patch("/{job_id}/result")
+def update_result(job_id: int, updated_result: ResultEdit, session: Session = Depends(get_session)):
+    """Validate edits and save edited_json without replacing the original OCR result."""
+    job = get_job_or_404(session, job_id)
+
+    if job.status != JobStatus.done:
+        raise HTTPException(409, "Only completed jobs can be edited.")
+
+    result = get_result_or_404(session, job_id)
+
+    if not (updated_result.cells or updated_result.texts or updated_result.regions or updated_result.pages):
+        raise HTTPException(422, "Supply at least one text or cell edit.")
+
+    try:
+        saved_result = result.edited_json if result.edited_json is not None else result.result_json
+        result.edited_json = apply_document_edits(saved_result, updated_result)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+    result.updated_at = now_toronto()
+
+    session.add(result)
     session.commit()
-    session.refresh(job)
 
-    # save img file to local disk
-    upload_dir = Path(f"/Users/sumin/Desktop/study/Personal Projects/ocr-document/storage/uploads/jobs/{job.id}")
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    file_path = upload_dir / filename
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    job.file_path = str(file_path)
-    job.updated_at = now_toronto()
-    session.commit()
-
-    process_job.delay(job.id)
-
-    # return job id, job status, response
-    return {
-        "job_id": job.id,
-        "status": job.status
-    }
-
-@router.patch("/{job_id}/result", response_model=JobResult, tags=["jobs"])
-def update_result(job_id: int, updated_result: dict):
-    session = next(get_session())
-    job_result = session.get(JobResult, job_id)
-    if not job_result:
-        raise HTTPException(status_code=404, detail="Job result not found")
-    
-    job_result.edited_json = updated_result
-    session.add(job_result)
-    session.commit()
-    session.refresh(job_result)
-    
-    return job_result
-
-
-
-
-# @router.post("/{job_id}/retry", tags=["jobs"])
-# def retry_job():
-#     # change status to queued and euqueue
-#     pass
-
-# @router.post("/{job_id}/cancel", tags=["jobs"])
-# def cancel_job():
-#     pass
-
-# @router.post("/tem", tags=["jobs"])
-# async def upload_file(file: UploadFile):
-#     print(file)
-#     content = await file.read()
-
-#     nparr = np.frombuffer(content, np.uint8)
-#     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-#     if image is None:
-#         return {"status": "invalid image"}
-    
-#     texts, cells = table_structure.detect(image)
-
-#     # metadata
-#     meta = {
-#         "file_name": file.filename,
-#         "file_type": file.content_type,
-#     }
-
-#     # extract y_values
-#     y_vals = []
-#     for cell in cells:
-#         y_min = math.floor(cell.bbox.y_min)
-#         y_max = math.floor(cell.bbox.y_max)
-#         y_vals.append({
-#             "y_min": y_min,
-#             "y_max": y_max,
-#         })
-
-#     # row boundaries
-#     y_boundaries = []
-#     y_first = y_vals[0]['y_min']
-#     y_boundaries.append(y_first)
-#     for y in y_vals:
-#         y_boundaries.append(y['y_max'])
-
-#     y_boundaries = list(set(y_boundaries))
-#     y_boundaries.sort()
-
-#     return {"status": "ok", "meta": meta, "texts": texts, "cells": cells, "y_boundaries": y_boundaries}
+    return {"status": "done", **present_document(result.edited_json)}

@@ -1,8 +1,10 @@
-from .engine import engine
-from sqlmodel import Session, SQLModel
+"""Provide request-scoped database sessions."""
 
-SQLModel.metadata.create_all(engine)
+from .engine import engine
+from sqlmodel import Session
+
 
 def get_session() -> Session:
+    """Yield a session and close it after the request; callers commit their own changes."""
     with Session(engine) as session:
         yield session

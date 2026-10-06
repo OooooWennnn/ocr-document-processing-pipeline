@@ -1,0 +1,4 @@
+[tool.black]
+line-length = 1000
+skip-magic-trailing-comma = true
+target-version = ["py312"]

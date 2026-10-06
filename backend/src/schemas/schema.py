@@ -1,33 +1,31 @@
+"""Internal OCR data types, separate from database and HTTP models."""
+
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List
+
 
 @dataclass
 class BBox:
+    """Pixel bounds on the source page; x increases right and y increases down."""
     x_min: float
     y_min: float
     x_max: float
     y_max: float
-    
+
 
 @dataclass
 class TextItem:
-    """
-    Represents a detected text
+    """Recognized text, bounds and confidence; None means no OCR score is available."""
 
-    Attributes:
-        text: 
-        confidence:
-        bbox:
-    """
     value: str
-    score: float
+    score: float | None
     bbox: BBox
-    
+
+
 @dataclass
 class Cell:
-    """
-    Represents a cell in a table 
-    """
+    """Cell bounds, grid position, row/column spans and assigned text."""
+
     row: int
     col: int
     bbox: BBox
@@ -35,33 +33,20 @@ class Cell:
     colspan: int = 1
     texts: List[TextItem] = field(default_factory=list)
 
-@dataclass
-class TableRow:
-    """
-    Represents a row in a table
-    """
-    row_id: int
-    bbox: BBox
-    cells: List[Cell] = field(default_factory=dict) # key = col
 
 @dataclass
-class RawTable:
-    """
-    Represents a raw table with detected cells but without row/col assignment
-    """
-    id: str
+class TableRow:
+    """Group cells that start on the same row."""
+
+    row_id: int
     bbox: BBox
-    cells: List[Cell] = field(default_factory=list)
+    cells: List[Cell] = field(default_factory=list)  # Key cells by column.
+
 
 @dataclass
 class Table:
-    """
-    Represents a table
-    """
+    """A reconstructed table with an ID, bounds and rows."""
+
     id: str
     bbox: BBox
     table_rows: List[TableRow] = field(default_factory=list)
-
-@dataclass
-class DocRegion:
-    pass

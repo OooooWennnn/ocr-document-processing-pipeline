@@ -1,18 +1,122 @@
-version: :3.8
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}@db:5432/${POSTGRES_DB:-ocr_db}
+  REDIS_URL: redis://redis:6379/0
+  OCR_STORAGE_DIR: /app/storage
+  # Read existing database paths without rewriting rows or moving uploads.
+  OCR_STORAGE_LEGACY_ROOT: ${OCR_STORAGE_LEGACY_ROOT:-${PWD}/storage}
+  CORS_ORIGINS: http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}
+  OCR_LANGUAGE: ${OCR_LANGUAGE:-korean}
+  OCR_DETECTION_SIZE: ${OCR_DETECTION_SIZE:-2048}
+  OCR_UPSCALE_TARGET: ${OCR_UPSCALE_TARGET:-1600}
+  OCR_REFINE_MAX_CROPS: ${OCR_REFINE_MAX_CROPS:-64}
+  OCR_DETECTION_MAX_PIXELS: ${OCR_DETECTION_MAX_PIXELS:-1000000}
+  OCR_TASK_TIME_LIMIT: ${OCR_TASK_TIME_LIMIT:-5400}
+  OCR_RECOGNITION_BATCH_SIZE: ${OCR_RECOGNITION_BATCH_SIZE:-4}
+  PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+  OCR_CPU_THREADS: ${OCR_CPU_THREADS:-4}
+  OCR_WARMUP: ${OCR_WARMUP:-1}
 
 services:
   db:
     image: postgres:18
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: 11223344
-      POSTGRES_DB: ocr_db
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}
+      POSTGRES_DB: ${POSTGRES_DB:-ocr_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
-      - ./.data/postgres:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
 
   redis:
     image: redis:8.6.3-alpine
+    command: [redis-server, --appendonly, "yes"]
     ports:
-      - "63797:6379"
+      - "127.0.0.1:${REDIS_PORT:-63797}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      target: api
+    environment: *backend-environment
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ${OCR_STORAGE_HOST_DIR:-./storage}:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    environment: *backend-environment
+    shm_size: 1gb
+    mem_limit: ${OCR_WORKER_MEMORY_LIMIT:-7g}
+    memswap_limit: ${OCR_WORKER_MEMORY_LIMIT:-7g}
+    oom_score_adj: 500
+    volumes:
+      - ${OCR_STORAGE_HOST_DIR:-./storage}:/app/storage
+      - paddle_models:/root/.paddlex
+      - model_download_cache:/root/.cache
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD-SHELL, 'celery -A src.core.celery_app:celery_app inspect ping --destination="ocr@$$HOSTNAME" --timeout=5']
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 15m
+    stop_grace_period: 2m
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:${BACKEND_PORT:-8000}}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  paddle_models:
+  model_download_cache:
