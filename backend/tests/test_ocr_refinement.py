@@ -64,6 +64,58 @@ class RefinementTests(unittest.TestCase):
 
             self.assertEqual(refine_page(self.image, [t], self.tables([t]), forbidden)[0], [t])
 
+    def test_rejected_crossing_crops_leave_budget_for_useful_text(self):
+        outside = TextItem("partly outside", 0.95, BBox(-50, 10, 120, 25))
+        uncertain = TextItem("uncertain", 0.3, BBox(5, 35, 45, 45))
+        tables = self.tables([outside, uncertain])
+
+        def recognize(crops):
+            self.assertEqual(len(crops), 1)
+
+            return [{"rec_text": "corrected", "rec_score": 0.95}]
+
+        with patch.dict("os.environ", {"OCR_REFINE_MAX_CROPS": "2"}):
+            out, stats = refine_page(self.image, [outside, uncertain], tables, recognize)
+
+        self.assertEqual([text.value for text in out], ["partly outside", "corrected"])
+        self.assertEqual(stats, {"attempted_crops": 1, "accepted_lines": 1})
+        self.assertEqual(tables[0]["table_rows"][0]["cells"][0]["original_value"], "corrected")
+
+    def test_stacked_lines_are_read_separately_within_budget(self):
+        for top in [5, 22, 39]:
+            self.image[top:top + 8, 12:30] = 0
+
+        text = TextItem("merged", 0.4, BBox(8, 2, 35, 50))
+
+        def recognize(crops):
+            self.assertEqual(len(crops), 3)
+
+            return [{"rec_text": value, "rec_score": 0.96} for value in ["10", "20", "30"]]
+
+        neighbor = TextItem("adjacent", 0.98, BBox(40, 5, 58, 13))
+        out, stats = refine_page(self.image, [text, neighbor], [], recognize)
+
+        self.assertEqual([item.value for item in out], ["adjacent", "10", "20", "30"])
+        self.assertEqual(stats, {"attempted_crops": 3, "accepted_lines": 1})
+        self.assertEqual([round((item.bbox.y_min + item.bbox.y_max) / 2) for item in out[1:]], [9, 26, 43])
+
+        with patch.dict("os.environ", {"OCR_REFINE_MAX_CROPS": "2"}):
+            out, stats = refine_page(self.image, [text, neighbor], [], lambda crops: self.fail("Crop budget exceeded"))
+
+        self.assertEqual(out, [text, neighbor])
+        self.assertEqual(stats["attempted_crops"], 0)
+
+    def test_uncertain_split_fragment_preserves_the_whole_original(self):
+        for top in [5, 22, 39]:
+            self.image[top:top + 8, 12:30] = 0
+
+        text = TextItem("original", 0.4, BBox(8, 2, 35, 50))
+        predictions = [{"rec_text": "10", "rec_score": 0.96}, {"rec_text": "20", "rec_score": 0.6}, {"rec_text": "30", "rec_score": 0.96}]
+        out, stats = refine_page(self.image, [text], [], lambda crops: predictions)
+
+        self.assertEqual(out, [text])
+        self.assertEqual(stats["accepted_lines"], 0)
+
     def test_majority_overlap_cannot_assign_whole_string_to_wrong_field(self):
         t = TextItem("two fields", 0.95, BBox(30, 10, 75, 25))
         table = self.tables([t])[0]

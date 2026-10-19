@@ -1,6 +1,7 @@
 """Document uploads, job status, source previews and saved edits."""
 
 import os
+import logging
 from io import BytesIO
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pathlib import Path
@@ -8,7 +9,9 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel, Field, ConfigDict
 from sqlmodel import Session, select
@@ -19,8 +22,10 @@ from src.services.result_editing import apply_document_edits, present_document
 from src.tasks.ocr_tasks import process_job
 from src.util import now_toronto
 from src.services.document_input import validate_pdf, preview_path, resolve_source_path
+from src.services.document_storage import is_s3, save_upload, delete_upload, preview_location, open_s3_file, stream_s3_body
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 MAX_BYTES = 50 * 1024 * 1024
 
 MAX_PIXELS = 25_000_000
@@ -94,6 +99,20 @@ def get_image(job_id: int, page_index: int = 0, session: Session = Depends(get_s
     if not 0 <= page_index < (job.page_count or 1):
         raise HTTPException(404, "Page not found.")
 
+    if job.file_path and is_s3(job.file_path):
+        location = preview_location(job.file_path, page_index) if job.file_type == "application/pdf" else job.file_path
+
+        try:
+            stored = open_s3_file(location)
+        except Exception as exc:
+            if isinstance(exc, ClientError) and exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "NotFound", "404"):
+                raise HTTPException(404, "Page preview is not available yet.")
+
+            logger.exception("Could not read the S3 preview for job %s", job_id)
+            raise HTTPException(503, "Document storage is unavailable. Please try again shortly.")
+
+        return StreamingResponse(stream_s3_body(stored["Body"]), media_type="image/png", headers={"Cache-Control": "private, no-store", "Content-Length": str(stored["ContentLength"])})
+
     source = resolve_source_path(job.file_path) if job.file_path else Path("")
     path = source
 
@@ -110,7 +129,9 @@ def get_image(job_id: int, page_index: int = 0, session: Session = Depends(get_s
 def get_result(job_id: int, session: Session = Depends(get_session)):
     """Return saved edits before OCR originals, with job status and page progress."""
     job = get_job_or_404(session, job_id)
-    data = session.exec(select(JobResult).where(JobResult.job_id == job_id).order_by(JobResult.id.desc())).first()
+    # 화면에 사용하지 않는 모델 원본(raw_json)은 DB에서 읽지 않는다.
+    query = select(JobResult.result_json, JobResult.edited_json).where(JobResult.job_id == job_id).order_by(JobResult.id.desc()).limit(1)
+    data = session.exec(query).first()
     payload = {}
 
     if data and data.result_json:
@@ -135,6 +156,7 @@ async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
     extension = ".pdf" if is_pdf else ".png"
     destination = STORAGE_ROOT / "uploads" / f"{uuid4().hex}{extension}"
     image = None
+    saved_source = None
 
     if is_pdf:
         try:
@@ -170,10 +192,13 @@ async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
         elif not cv2.imwrite(str(destination), image):
             raise OSError("image write failed")
 
+        content_type = "application/pdf" if is_pdf else "image/png"
+        saved_source = await run_in_threadpool(save_upload, destination, content_type)
+
         job_data = {
             "original_filename": file.filename or "image",
             "file_type": "application/pdf" if is_pdf else "image/png",
-            "file_path": str(destination),
+            "file_path": saved_source,
             "page_count": page_count,
             "status": JobStatus.queued,
         }
@@ -183,9 +208,23 @@ async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
         session.commit()
         session.refresh(job)
     except Exception:
+        logger.exception("Could not save an uploaded document")
         session.rollback()
         destination.unlink(missing_ok=True)
+
+        if saved_source and is_s3(saved_source):
+            try:
+                await run_in_threadpool(delete_upload, saved_source)
+            except Exception:
+                logger.exception("Could not remove an upload after database save failed")
+
         raise HTTPException(500, "The document could not be saved.")
+
+    if is_s3(saved_source):
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove the local copy of job %s", job.id)
 
     try:
         process_job.delay(job.id)

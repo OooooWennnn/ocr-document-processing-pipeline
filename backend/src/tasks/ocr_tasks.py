@@ -13,8 +13,9 @@ from src.models.job_model import Job, JobResult, JobStatus
 from src.util import now_toronto
 from src.tasks.ocr_runtime import get_extractor
 from src.tasks.ocr_task_base import DocumentTask
-from src.services.document_input import iter_pages, preview_path, resolve_source_path
-from src.services.table_extraction import BBox, coverage
+from src.services.document_input import iter_pages, preview_path
+from src.services.document_storage import local_source, save_preview
+from src.services.document_layout import covered_fraction, normalize
 
 logger = logging.getLogger(__name__)
 
@@ -50,19 +51,25 @@ def reset_child_connections(**kwargs):
 
 
 def merge_native_text(page, native):
-    """Update page text in place, preferring native PDF tokens and keeping OCR-only regions."""
+    """PDF 토큰 여러 개가 덮는 면적으로 OCR 중복을 제거한다. 이미지에만 있는 글자는 유지하며 page를 직접 수정한다."""
 
     if not native:
         return
 
-    boxes = [BBox(**t["bbox"]) for t in native]
+    boxes = [token["bbox"] for token in native]
     extra = []
 
     for text in page["texts"]:
-        text_box = BBox(**text["bbox"])
+        contained = [token for token in native if covered_fraction(token["bbox"], [text["bbox"]]) >= 0.5]
+        native_value = normalize("".join(token["value"] for token in contained))
+        value = normalize(text["value"])
 
-        if not any(coverage(text_box, box) >= 0.5 for box in boxes):
+        # OCR 박스에 여백이 많으면 반대 방향의 포함 관계와 실제 글자도 확인한다.
+        same_text = bool(value) and value in native_value
+
+        if covered_fraction(text["bbox"], boxes) < 0.5 and not same_text:
             extra.append(text)
+
     texts = sorted([*native, *extra], key=lambda t: (t["bbox"]["y_min"], t["bbox"]["x_min"]))
     page["texts"] = [{**t, "id": str(i)} for i, t in enumerate(texts)]
     page["text_source"] = "pdf_text+ocr" if extra else "pdf_text"
@@ -105,37 +112,40 @@ def process_job(job_id: int):
 
             extractor = get_extractor()
 
-            for index, pil_image, native, native_only in iter_pages(job.file_path, job.file_type):
-                image = cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
+            with local_source(job.file_path) as source:
+                for index, pil_image, native, native_only in iter_pages(source, job.file_type):
+                    image = cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
 
-                if job.file_type == "application/pdf":
-                    destination = preview_path(resolve_source_path(job.file_path), index)
+                    if job.file_type == "application/pdf":
+                        destination = preview_path(source, index)
 
-                    destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.parent.mkdir(parents=True, exist_ok=True)
 
-                    if not cv2.imwrite(str(destination), image):
-                        raise OSError("Could not save page preview")
+                        if not cv2.imwrite(str(destination), image):
+                            raise OSError("Could not save page preview")
 
-                if native_only:
-                    raw, page = extractor.detect_document(image, native_texts=native)
-                else:
-                    raw, page = extractor.detect_document(image)
+                        save_preview(job.file_path, destination, index)
 
-                merge_native_text(page, native)
+                    if native_only:
+                        raw, page = extractor.detect_document(image, native_texts=native)
+                    else:
+                        raw, page = extractor.detect_document(image)
 
-                page["page_index"] = index
+                    merge_native_text(page, native)
 
-                document["pages"].append(page)
-                raw_pages.append(raw)
+                    page["page_index"] = index
 
-                # Assign fresh JSON objects so the ORM tracks each completed page.
-                result.result_json = {**document, "pages": list(document["pages"])}
-                result.raw_json = {"pages": list(raw_pages)}
-                result.edited_json = None
-                job.updated_at = now_toronto()
+                    document["pages"].append(page)
+                    raw_pages.append(raw)
 
-                session.commit()
-                logger.info("Job %s page %s/%s complete in %.1fs", job_id, index + 1, document["page_count"], page["elapsed_seconds"])
+                    # Assign fresh JSON objects so the ORM tracks each completed page.
+                    result.result_json = {**document, "pages": list(document["pages"])}
+                    result.raw_json = {"pages": list(raw_pages)}
+                    result.edited_json = None
+                    job.updated_at = now_toronto()
+
+                    session.commit()
+                    logger.info("Job %s page %s/%s complete in %.1fs", job_id, index + 1, document["page_count"], page["elapsed_seconds"])
 
             document["elapsed_seconds"] = round(time.perf_counter() - started, 3)
             result.result_json = document

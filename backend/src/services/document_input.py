@@ -64,6 +64,82 @@ def preview_path(source, page_index):
     return Path(source).with_suffix("") / f"page-{page_index}.png"
 
 
+def pdf_text_tokens(textpage, posconv):
+    """PDF 문자 순서와 공백을 유지해 줄 단위 토큰을 반환한다. 멀리 떨어진 필드는 분리한다."""
+    tokens = []
+    characters = []
+    boxes = []
+    line_break = False
+    previous_font = None
+
+    def finish_line():
+        """모은 글자와 좌표를 토큰 하나로 저장하고 다음 줄을 준비한다."""
+        value = "".join(characters).strip()
+
+        if value and boxes:
+            left, bottom = min(box[0] for box in boxes), min(box[1] for box in boxes)
+            right, top = max(box[2] for box in boxes), max(box[3] for box in boxes)
+            corners = [posconv.to_bitmap(x, y) for x, y in [(left, bottom), (left, top), (right, bottom), (right, top)]]
+            bbox = {"x_min": min(point[0] for point in corners), "y_min": min(point[1] for point in corners), "x_max": max(point[0] for point in corners), "y_max": max(point[1] for point in corners)}
+            tokens.append({"value": value, "original_value": value, "score": None, "source": "pdf_text", "bbox": bbox})
+
+        characters.clear()
+        boxes.clear()
+
+    for index in range(textpage.count_chars()):
+        codepoint = pdfium.raw.FPDFText_GetUnicode(textpage, index)
+
+        if not codepoint:
+            continue
+
+        character = chr(codepoint)
+
+        if character in "\r\n":
+            # PDFium이 같은 줄의 글자 사이에도 줄바꿈을 삽입할 수 있어 좌표로 확인한다.
+            line_break = True
+            continue
+
+        if character == "\t":
+            finish_line()
+            continue
+
+        if character.isspace():
+            if characters:
+                characters.append(character)
+
+            continue
+
+        left, bottom, right, top = textpage.get_charbox(index)
+
+        if right <= left or top <= bottom:
+            continue
+
+        font_box = textpage.get_charbox(index, loose=True)
+
+        if boxes:
+            previous = boxes[-1]
+            line_bottom, line_top = min(box[1] for box in boxes), max(box[3] for box in boxes)
+            line_height = line_top - line_bottom
+            height = top - bottom
+            font_height = min(previous_font[3] - previous_font[1], font_box[3] - font_box[1])
+            overlap = min(previous_font[3], font_box[3]) - max(previous_font[1], font_box[1])
+            gap = left - previous[2]
+
+            if overlap < font_height * 0.5 or gap > max(height, line_height) * 1.5 or right < previous[0]:
+                finish_line()
+            elif line_break and gap > max(height, line_height) * 0.25 and not characters[-1].isspace():
+                characters.append(" ")
+
+        characters.append(character)
+        boxes.append((left, bottom, right, top))
+        line_break = False
+        previous_font = font_box
+
+    finish_line()
+
+    return tokens
+
+
 def iter_pages(source, file_type):
     """Yield (index, RGB image, native tokens, native_only) one page at a time.
     Convert PDF text to pixel coordinates; native_only requires text and no image objects."""
@@ -91,31 +167,9 @@ def iter_pages(source, file_type):
                 if image.width * image.height > MAX_PAGE_PIXELS:
                     raise ValueError("The rendered PDF page is too large.")
 
-                tokens = []
-
                 # Use rendered coordinates to account for PDF rotation and pixel rounding.
                 with closing(page.get_textpage()) as textpage:
-                    for i in range(textpage.count_rects()):
-                        left, bottom, right, top = textpage.get_rect(i)
-                        value = textpage.get_text_bounded(left, bottom, right, top).strip()
-
-                        if value and right > left and top > bottom:
-                            corners = [posconv.to_bitmap(x, y) for x, y in [(left, bottom), (left, top), (right, bottom), (right, top)]]
-
-                            bbox = {
-                                "x_min": min(corner[0] for corner in corners),
-                                "y_min": min(corner[1] for corner in corners),
-                                "x_max": max(corner[0] for corner in corners),
-                                "y_max": max(corner[1] for corner in corners),
-                            }
-                            token = {
-                                "value": value,
-                                "original_value": value,
-                                "score": None,
-                                "source": "pdf_text",
-                                "bbox": bbox,
-                            }
-                            tokens.append(token)
+                    tokens = pdf_text_tokens(textpage, posconv)
 
                 has_images = any(page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE]))
 

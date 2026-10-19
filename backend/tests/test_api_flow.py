@@ -5,12 +5,13 @@ import sys
 import tempfile
 import types
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ["REDIS_URL"] = "redis://localhost:63797/15"
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.dialects.postgresql import JSONB
@@ -37,6 +38,11 @@ from src.schemas.schema import BBox, Cell, TextItem
 
 class ApiFlowTests(unittest.TestCase):
     def setUp(self):
+        # 실제 .env에 버킷이 설정돼 있어도 일반 API 테스트는 로컬 임시 저장소만 사용한다.
+        self.local_storage = patch.dict(os.environ, {"OCR_S3_BUCKET": ""})
+        self.local_storage.start()
+        self.addCleanup(self.local_storage.stop)
+
         SQLModel.metadata.drop_all(engine)
         SQLModel.metadata.create_all(engine)
 
@@ -76,6 +82,60 @@ class ApiFlowTests(unittest.TestCase):
 
         with Session(engine) as session:
             self.assertEqual(session.get(JobResult, 7).result_json, original)
+
+    def test_latest_result_preserves_edit_priority_without_loading_raw_json(self):
+        original = {"schema_version": 3, "page_count": 1, "pages": [{"page_index": 0, "image_width": 100, "image_height": 100, "tables": [], "texts": [{"id": "0", "value": "original", "score": 0.9, "bbox": {"x_min": 0, "y_min": 0, "x_max": 80, "y_max": 20}}]}]}
+        edited = deepcopy(original)
+        edited["pages"][0]["texts"][0]["value"] = "edited"
+
+        with Session(engine) as session:
+            session.add(Job(id=43, original_filename="test.png", file_type="image/png", status=JobStatus.done))
+            session.commit()
+            session.add(JobResult(id=8, job_id=43, result_json={"schema_version": 3, "pages": []}))
+            session.add(JobResult(id=9, job_id=43, raw_json={"unused": "model output" * 1000}, result_json=original))
+            session.commit()
+
+        selected_columns = []
+
+        def record_columns(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("SELECT") and "jobresult" in statement.lower():
+                selected_columns.append([column[0] for column in cursor.description])
+
+        event.listen(engine, "after_cursor_execute", record_columns)
+
+        try:
+            for saved_edit in (None, edited):
+                with self.subTest(edited=saved_edit):
+                    with Session(engine) as session:
+                        saved = session.get(JobResult, 9)
+                        saved.edited_json = saved_edit
+                        session.add(saved)
+                        session.commit()
+
+                    selected_columns.clear()
+                    response = self.client.get("/api/v1/jobs/43/result")
+                    expected = jobs.present_document(original if saved_edit is None else saved_edit)
+
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json(), {**expected, "status": "done", "message": None, "page_count": 1})
+                    self.assertEqual(selected_columns, [["result_json", "edited_json"]])
+        finally:
+            event.remove(engine, "after_cursor_execute", record_columns)
+
+    def test_result_without_completed_pages_preserves_status_response(self):
+        with Session(engine) as session:
+            session.add(Job(id=44, original_filename="pending.pdf", file_type="application/pdf", page_count=3, status=JobStatus.processing))
+            session.commit()
+
+        expected = {"status": "processing", "message": None, "page_count": 3}
+
+        self.assertEqual(self.client.get("/api/v1/jobs/44/result").json(), expected)
+
+        with Session(engine) as session:
+            session.add(JobResult(job_id=44, result_json={}, edited_json={"schema_version": 3, "pages": []}))
+            session.commit()
+
+        self.assertEqual(self.client.get("/api/v1/jobs/44/result").json(), expected)
 
     def test_image_upload_and_preview_have_identical_normalized_pixels(self):
         import io

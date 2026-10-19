@@ -98,6 +98,18 @@ class TableExtraction:
                 "text_recognition_batch_size": recognition_batch_size(),
                 "cpu_threads": int(os.getenv("OCR_CPU_THREADS", "4")),
             }
+            recognition_models = {"korean": "korean_PP-OCRv5_mobile_rec", "en": "PP-OCRv5_server_rec"}
+            recognition_model = recognition_models.get(model_options["lang"])
+
+            if recognition_model:
+                # 모델을 직접 지정하면 lang가 무시되므로 기존 언어별 인식기도 함께 지정한다.
+                model_options.pop("lang")
+                model_options["text_detection_model_name"] = os.getenv("OCR_DETECTION_MODEL", "PP-OCRv5_mobile_det")
+                model_options["text_recognition_model_name"] = recognition_model
+
+                if model_options["text_detection_model_name"] == "PP-OCRv5_mobile_det":
+                    model_options["text_det_unclip_ratio"] = 1.0
+
             self.model = PPStructureV3(**model_options)
 
         self.share_table_ocr(self.model.paddlex_pipeline)

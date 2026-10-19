@@ -139,7 +139,9 @@ does not change the database user's password.
 | `POSTGRES_PORT` / `REDIS_PORT`   | `5432` / `63797`        | Local database and queue ports                                            |
 | `NEXT_PUBLIC_API_URL`            | `http://localhost:8000` | API address used by the browser                                           |
 | `OCR_LANGUAGE`                   | `korean`                | Recognition language; use `en` for English documents                      |
+| `OCR_DETECTION_MODEL`            | `PP-OCRv5_mobile_det`   | Text detector for Korean and English; `PP-OCRv5_server_det` uses the previous detector |
 | `OCR_WARMUP`                     | `1`                     | Load the model after worker startup; `0` loads it on the first job        |
+| `OCR_WORKER_MAX_TASKS_PER_CHILD`  | `5`                     | Replace the worker child after this many tasks, including warmup; minimum 1 |
 | `OCR_CPU_THREADS`                | `4`                     | CPU threads used by the model                                             |
 | `OCR_RECOGNITION_BATCH_SIZE`     | `4`                     | Text crops recognized together                                            |
 | `OCR_DETECTION_SIZE`             | `2048`                  | Maximum long side for text detection                                      |
@@ -157,10 +159,16 @@ Higher detection limits and larger batches use more memory. The detector budget
 does not resize the recognition source crops, but a lower budget can make very
 small text harder to locate.
 
+Korean and English use the mobile text detector while keeping their existing
+language recognizer. Other languages retain PaddleOCR's language defaults.
+The mobile detector uses tighter text boxes to avoid spilling into nearby cells.
+See [performance notes](docs/performance.md) for measurements, failed experiments
+and commands for comparing the detectors on the same documents.
+
 ## How processing works
 
-1. The API validates the file, saves it to `storage/uploads`, and creates a `Job`
-   row in PostgreSQL.
+1. The API validates the file, saves it to `storage/uploads` or the configured S3
+   bucket, and creates a `Job` row in PostgreSQL.
 2. It sends the job ID to Redis and returns immediately. The browser polls for
    progress; the upload response does not mean OCR has finished.
 3. The Celery worker reads the file and processes its pages in order. It reuses
@@ -177,8 +185,9 @@ Pages containing images use OCR, then merge embedded text with OCR-only regions.
 
 The worker uses one prefork child and replaces it after five Celery tasks to
 release retained memory. Warmup counts as one task. A replacement child reloads
-the model when needed. If a child is killed or hits its hard timeout, the parent
-tries to record the job as failed.
+the model when needed. `OCR_WORKER_MAX_TASKS_PER_CHILD` controls this interval;
+keep the default until repeated jobs show stable memory use. If a child is killed
+or hits its hard timeout, the parent tries to record the job as failed.
 
 ## Project layout
 
@@ -196,7 +205,7 @@ frontend/
   components/ocr/           Upload and document editor
   hooks/                    Upload state and result polling
   lib/                      API types, requests and exports
-docker-compose.yml          Local services and shared storage
+docker-compose.yml          Services, storage and optional separate worker host
 .env.example                Compose configuration template
 ```
 
@@ -210,11 +219,28 @@ in `services/` depend on these versions, so check them when upgrading.
 PostgreSQL stores job metadata and JSONB results. Uploaded files and PDF page
 previews live in `./storage`, shared by the API and worker.
 
+Set `OCR_S3_BUCKET` and `AWS_REGION` to store new uploads and PDF previews in a
+private S3 bucket instead. The API keeps its existing image endpoint, and the
+worker downloads one document to temporary storage for processing. Database
+schema and result JSON stay unchanged; `file_path` stores an S3 URI for new S3
+uploads. Leaving the bucket empty preserves local storage. Existing files are
+not moved automatically.
+
+See [AWS deployment](docs/aws-deployment.md) for IAM role permissions, separate
+web/worker EC2 startup commands, network settings and CPU benchmarking limits.
+To try S3 with the local Docker stack first, follow its
+[local S3 setup](docs/aws-deployment.md#connect-s3-from-the-local-docker-stack).
+That setup uses the optional `docker-compose.s3-local.yml` to read existing host
+AWS credentials; EC2 uses IAM roles without this override.
+
 | Field         | Contents                                     |
 | ------------- | -------------------------------------------- |
 | `raw_json`    | Model output and preprocessing details       |
 | `result_json` | Original extracted document, grouped by page |
 | `edited_json` | Saved user edits applied to the document     |
+
+Result polling reads the latest row's original and edited documents without
+loading `raw_json`. The raw model output stays in the database for inspection.
 
 Database, Redis and model caches use named Docker volumes. `docker compose down`
 stops the stack without removing them. Adding `-v` deletes those volumes, including
@@ -241,8 +267,10 @@ docker compose run --rm --no-deps worker python -m unittest discover -s tests -v
 ```
 
 The tests cover uploads, PDF handling, table geometry, text mapping, edit
-validation and interrupted workers. API tests use an isolated SQLite database
-and a mocked queue. These checks do not measure OCR accuracy across real documents.
+validation, interrupted workers and S3 file handling. API tests use an isolated
+SQLite database and a mocked queue; S3 tests use an in-memory fake without AWS
+credentials. These checks do not measure OCR accuracy across real documents or
+validate a real AWS deployment.
 
 Frontend lint, TypeScript checks and the production build run with:
 
@@ -265,5 +293,6 @@ docker compose build frontend
   container or host failure can leave a job marked as `processing`.
 - There is no job history screen, automatic resume, retry endpoint or edit
   version check for multiple users.
-- The Compose setup is for local use. It binds ports to localhost and has no
-  authentication, HTTPS or managed storage configuration.
+- Compose binds ports to localhost by default. S3 and separate EC2 hosts can be
+  configured, but authentication and HTTPS still need to be added before public
+  use. The AWS setup has not been tested against live resources.

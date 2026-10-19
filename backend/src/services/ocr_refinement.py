@@ -12,6 +12,40 @@ MIN_CROSSING_SCORE = 0.75
 MIN_SCORE_GAIN = 0.04
 
 
+def split_stacked_lines(image, box):
+    """표 밖의 세로로 합쳐진 텍스트를 비슷한 높이의 잉크 줄로 나눈다. 이미지와 원본 좌표는 수정하지 않는다."""
+    import cv2
+
+    if box.y_max - box.y_min <= (box.x_max - box.x_min) * 1.2:
+        return [box]
+
+    left, right = max(0, math.floor(box.x_min)), min(image.shape[1], math.ceil(box.x_max))
+    top, bottom = max(0, math.floor(box.y_min)), min(image.shape[0], math.ceil(box.y_max))
+
+    if right - left < 3 or bottom - top < 3:
+        return [box]
+
+    gray = cv2.cvtColor(image[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+    ink = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)[1]
+    rows = cv2.reduce(ink, 1, cv2.REDUCE_MAX)
+    rows = cv2.morphologyEx(rows, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)))
+    contours = cv2.findContours(rows, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+    bands = []
+
+    for contour in contours:
+        _, y, _, height = cv2.boundingRect(contour)
+
+        if height >= 3:
+            bands.append((y, height))
+
+    bands.sort()
+
+    if len(bands) < 2 or max(height for _, height in bands) > min(height for _, height in bands) * 2:
+        return [box]
+
+    return [BBox(box.x_min, max(box.y_min, top + y - 1), box.x_max, min(box.y_max, top + y + height + 1)) for y, height in bands]
+
+
 def refine_page(image, texts, tables, recognize):
     """Return accepted text and refinement stats; update matching table cells in place.
     Reuse the recognizer and leave the source image unchanged."""
@@ -45,8 +79,9 @@ def refine_page(image, texts, tables, recognize):
 
         # Include nearby text to give short, uncertain fragments word context.
         line_indices = [text_index]
+        stacked_boxes = split_stacked_lines(cleaned, text.bbox) if not crossing and not tables else [text.bbox]
 
-        if not crossing:
+        if not crossing and len(stacked_boxes) == 1:
             owner = ranked[0][1] if ranked and ranked[0][0] >= MIN_CELL_COVERAGE else None
 
             for neighbor_index, other in enumerate(texts):
@@ -85,11 +120,13 @@ def refine_page(image, texts, tables, recognize):
                 candidates.append((crop_box, cell_index))
         else:
             owner = ranked[0][1] if ranked and ranked[0][0] >= MIN_CELL_COVERAGE else None
-            candidates = [(line_box, owner)]
+            boxes = stacked_boxes if len(stacked_boxes) > 1 else [line_box]
+            candidates = [(box, owner) for box in boxes]
 
         if len(crop_requests) + len(candidates) > limit:
             continue
 
+        request_start = len(crop_requests)
         crop_indices = []
 
         for box, owner in candidates:
@@ -109,6 +146,8 @@ def refine_page(image, texts, tables, recognize):
             crop_requests.append((crop, box, owner))
 
         if crossing and sum(coverage(line_box, crop_requests[request_index][1]) for request_index in crop_indices) < 0.85:
+            del crop_requests[request_start:]
+
             continue
 
         if crop_indices:
@@ -151,7 +190,7 @@ def refine_page(image, texts, tables, recognize):
         if crossing:
             if min(text.score for text in candidates) < MIN_CROSSING_SCORE:
                 continue
-        elif candidates[0].score < max(MIN_REFINED_SCORE, old_score + MIN_SCORE_GAIN):
+        elif min(text.score for text in candidates) < max(MIN_REFINED_SCORE, old_score + MIN_SCORE_GAIN):
             continue
 
         replaced_indices.update(line_indices)
