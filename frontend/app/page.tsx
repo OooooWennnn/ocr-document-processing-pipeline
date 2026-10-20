@@ -1,7 +1,7 @@
 "use client";
 import { AlertCircle, ArrowLeft, Check, LoaderCircle } from "lucide-react";
-import FileUpload from "@/components/ocr/FileUpload";
-import DocumentWorkspace from "@/components/ocr/DocumentWorkspace";
+import FileUpload from "@/components/FileUpload";
+import DocumentWorkspace from "@/components/DocumentWorkspace";
 import { useOcrJob } from "@/hooks/useOcrJob";
 /** Show upload, progress, error or editor views based on the job state. */
 export default function Home() {

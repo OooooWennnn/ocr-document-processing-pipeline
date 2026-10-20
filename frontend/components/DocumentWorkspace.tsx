@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import {
   Box,
+  DocumentRegion,
   getResult,
   JobResponse,
   saveDocument,
@@ -33,6 +34,18 @@ import {
 type Drafts = Record<number, Record<string, string>>;
 
 const LOW_CONFIDENCE_SCORE = 0.85;
+
+function needsReview(region: DocumentRegion): boolean {
+  return Boolean(
+    region.mapping_warning ||
+      (region.value &&
+        (region.score == null || region.score < LOW_CONFIDENCE_SCORE)),
+  );
+}
+
+function formatScore(score: number | null | undefined, fallback: string): string {
+  return score == null ? fallback : `${Math.round(score * 100)}%`;
+}
 
 function getPositionStyle(box: Box, container: Box): CSSProperties {
   const containerWidth = container.x_max - container.x_min;
@@ -84,7 +97,6 @@ export default function DocumentWorkspace({
 
   // Fetch positioned regions for older results without running OCR again.
   useEffect(() => {
-
     // Refresh cached results from the previous split view without running OCR again.
     const hasPositionedRegions = initial.pages?.every(
       (documentPage) => documentPage.regions !== undefined,
@@ -98,7 +110,9 @@ export default function DocumentWorkspace({
 
     getResult(jobId)
       .then((result) => {
-        if (isMounted) setDocumentData(result);
+        if (isMounted) {
+          setDocumentData(result);
+        }
       })
       .catch((error) => {
         if (isMounted) {
@@ -165,12 +179,8 @@ export default function DocumentWorkspace({
   }));
   const selectedRegion = regions.find((region) => region.id === selectedRegionId);
   const textRegions = showScores ? regions.filter((region) => region.value) : [];
-  const reviewCount = textRegions.filter(
-    (region) =>
-      region.score == null ||
-      region.score < LOW_CONFIDENCE_SCORE ||
-      region.mapping_warning,
-  ).length;
+  const reviewCount = textRegions.filter(needsReview).length;
+  const sourceUrl = sourceImageUrl(jobId, activePage.page_index);
 
   /** Select a region for both the source highlight and editor. */
   const selectRegion = (id: string) => {
@@ -414,30 +424,28 @@ export default function DocumentWorkspace({
             >
               <img
                 className="document-source"
-                src={sourceImageUrl(jobId, activePage.page_index)}
+                src={sourceUrl}
                 alt={`Original document page ${activePage.page_index + 1}`}
                 onLoad={handleSourceImageLoad}
                 onError={() => setSourceImageError(true)}
               />
               {regions.map((region) => {
-                const fontSize = regionFontSize(region, canvasReady) * canvasScale;
+                const fontSize =
+                  regionFontSize(region, canvasReady) * canvasScale;
                 const textLayout = regionTextLayout(region);
-                const regionWidth = Math.max(1, region.bbox.x_max - region.bbox.x_min);
-                const regionHeight = Math.max(1, region.bbox.y_max - region.bbox.y_min);
+                const regionWidth = Math.max(
+                  1,
+                  region.bbox.x_max - region.bbox.x_min,
+                );
+                const regionHeight = Math.max(
+                  1,
+                  region.bbox.y_max - region.bbox.y_min,
+                );
                 const isSelected = selectedRegionId === region.id;
                 const hasDraft = pageDrafts?.[region.id] !== undefined;
-                const needsReview =
-                  region.mapping_warning ||
-                  (region.value &&
-                    (region.score == null || region.score < LOW_CONFIDENCE_SCORE));
-                const ocrScore =
-                  region.score == null
-                    ? "unknown"
-                    : `${Math.round(region.score * 100)}%`;
-                const mappingScore =
-                  region.mapping_score == null
-                    ? "unknown"
-                    : `${Math.round(region.mapping_score * 100)}%`;
+                const showReviewWarning = needsReview(region);
+                const ocrScore = formatScore(region.score, "unknown");
+                const mappingScore = formatScore(region.mapping_score, "unknown");
                 const regionLocation =
                   region.kind === "cell"
                     ? `Table ${region.table_id}, row ${(region.row ?? 0) + 1}, column ${(region.col ?? 0) + 1}`
@@ -451,7 +459,7 @@ export default function DocumentWorkspace({
                     title={`${region.value || "Empty table cell"} · OCR ${ocrScore} · Mapping ${mappingScore}`}
                     aria-label={`${regionLocation}: ${region.value || "empty"}`}
                     aria-pressed={isSelected}
-                    className={`document-region ${region.kind} ${needsReview ? "needs-review" : ""} ${isSelected ? "selected" : ""} ${hasDraft ? "changed" : ""}`}
+                    className={`document-region ${region.kind} ${showReviewWarning ? "needs-review" : ""} ${isSelected ? "selected" : ""} ${hasDraft ? "changed" : ""}`}
                     style={{
                       ...getPositionStyle(region.bbox, pageBounds),
                       fontSize: `${fontSize}px`,
@@ -464,13 +472,10 @@ export default function DocumentWorkspace({
                   >
                     {!region.edited && region.tokens?.length ? (
                       region.tokens.map((token, tokenIndex) => (
-
                         <span
                           key={tokenIndex}
                           className="positioned-token"
-                          style={{
-                            ...getPositionStyle(token.bbox, region.bbox),
-                          }}
+                          style={getPositionStyle(token.bbox, region.bbox)}
                         >
                           {token.value}
                         </span>
@@ -523,14 +528,12 @@ export default function DocumentWorkspace({
               onClick={() => setView("source")}
             >
               <img
-                src={sourceImageUrl(jobId, activePage.page_index)}
+                src={sourceUrl}
                 alt="Original page for comparison"
               />
               {selectedRegion && (
                 <i
-                  style={{
-                    ...getPositionStyle(selectedRegion.bbox, pageBounds),
-                  }}
+                  style={getPositionStyle(selectedRegion.bbox, pageBounds)}
                 />
               )}
             </button>
@@ -543,7 +546,7 @@ export default function DocumentWorkspace({
                   viewBox={`${selectedRegion.bbox.x_min - 3} ${selectedRegion.bbox.y_min - 3} ${selectedRegion.bbox.x_max - selectedRegion.bbox.x_min + 6} ${selectedRegion.bbox.y_max - selectedRegion.bbox.y_min + 6}`}
                 >
                   <image
-                    href={sourceImageUrl(jobId, activePage.page_index)}
+                    href={sourceUrl}
                     width={dimensions.width}
                     height={dimensions.height}
                   />
@@ -574,7 +577,9 @@ export default function DocumentWorkspace({
                 maxLength={10000}
                 disabled={saving}
                 rows={6}
-                onChange={(event) => updateDraft(selectedRegion.id, event.target.value)}
+                onChange={(event) =>
+                  updateDraft(selectedRegion.id, event.target.value)
+                }
               />
               <dl>
                 <div>
@@ -600,9 +605,7 @@ export default function DocumentWorkspace({
                 <div>
                   <dt>OCR confidence</dt>
                   <dd>
-                    {selectedRegion.score == null
-                      ? "Unavailable"
-                      : `${Math.round(selectedRegion.score * 100)}%`}
+                    {formatScore(selectedRegion.score, "Unavailable")}
                   </dd>
                 </div>
               </dl>
@@ -610,9 +613,7 @@ export default function DocumentWorkspace({
                 <div>
                   <dt>Mapping coverage</dt>
                   <dd>
-                    {selectedRegion.mapping_score == null
-                      ? "Unavailable"
-                      : `${Math.round(selectedRegion.mapping_score * 100)}%`}
+                    {formatScore(selectedRegion.mapping_score, "Unavailable")}
                   </dd>
                 </div>
               </dl>
@@ -646,24 +647,18 @@ export default function DocumentWorkspace({
           {showScores && (
             <div className="field-score-list">
               <p className="eyebrow">
-                FIELD CONFIDENCE ·{" "}
-                {reviewCount}{" "}
-                TO REVIEW
+                FIELD CONFIDENCE · {reviewCount} TO REVIEW
               </p>
               {textRegions.map((region) => (
                 <button
                   key={region.id}
                   aria-pressed={selectedRegionId === region.id}
                   onClick={() => selectRegion(region.id)}
-                  className={
-                    region.mapping_warning || region.score == null || region.score < LOW_CONFIDENCE_SCORE
-                      ? "review"
-                      : ""
-                  }
+                  className={needsReview(region) ? "review" : ""}
                 >
                   <span>{region.value}</span>
                   <strong>
-                    {region.score == null ? "?" : `${Math.round(region.score * 100)}%`}
+                    {formatScore(region.score, "?")}
                   </strong>
                 </button>
               ))}
