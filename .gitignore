@@ -43,3 +43,12 @@ model-cache/
 .data/
 storage/
 .editorconfig
+
+/frontend/.next/
+/frontend/out/
+/frontend/build/
+/frontend/coverage/
+/frontend/.vercel/
+/frontend/next-env.d.ts
+*.tsbuildinfo
+*.pem

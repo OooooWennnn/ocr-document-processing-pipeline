@@ -3,7 +3,7 @@
 from dataclasses import asdict
 import math
 import os
-from src.schemas.schema import BBox, TextItem
+from src.schemas import BBox, TextItem
 from src.services.table_extraction import MIN_CELL_COVERAGE, coverage, ordered_text
 
 LOW_CONFIDENCE_SCORE = 0.85

@@ -1,13 +1,9 @@
 # Local S3 testing only. EC2 uses instance roles without this override.
 services:
-  backend:
+  backend: &aws-credentials
     environment:
       AWS_PROFILE: ${AWS_PROFILE:-default}
     volumes:
       - "${AWS_SHARED_CONFIG_DIR:-${HOME}/.aws}:/root/.aws:ro"
 
-  worker:
-    environment:
-      AWS_PROFILE: ${AWS_PROFILE:-default}
-    volumes:
-      - "${AWS_SHARED_CONFIG_DIR:-${HOME}/.aws}:/root/.aws:ro"
+  worker: *aws-credentials

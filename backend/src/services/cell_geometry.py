@@ -1,7 +1,7 @@
 """Refine predicted cells using table rules in the source image."""
 
 import math
-from src.schemas.schema import BBox, Cell
+from src.schemas import BBox, Cell
 
 
 def refine_cell_geometry(image, cells):

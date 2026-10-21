@@ -2,7 +2,7 @@
 
 from statistics import median
 import re
-from src.schemas.schema import BBox, TextItem
+from src.schemas import BBox, TextItem
 from src.services.table_extraction import MIN_CELL_COVERAGE, MIN_CELL_COVERAGE_GAP, ordered_text
 
 

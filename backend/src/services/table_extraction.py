@@ -8,13 +8,8 @@ import math
 import logging
 import os
 from statistics import median
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import numpy as np
-
 from src.services.ocr_limits import detection_side_limit, recognition_batch_size
-from src.schemas.schema import BBox, Cell, Table, TableRow, TextItem
+from src.schemas import BBox, Cell, Table, TableRow, TextItem
 
 MIN_CELL_COVERAGE = 0.85
 MIN_CELL_COVERAGE_GAP = 0.15
@@ -125,55 +120,6 @@ class TableExtraction:
 
         if table is not None and getattr(table, "general_ocr_pipeline", None) is None:
             table.general_ocr_pipeline = layout.general_ocr_pipeline
-
-    def detect(self, image: np.ndarray):
-        """Return (raw output, table) for exactly one table, using original image coordinates."""
-        import cv2
-
-        target = int(os.getenv("OCR_UPSCALE_TARGET", "1600"))
-        scale = min(2.0, max(1.0, target / max(image.shape[:2])))
-        prepared = image
-
-        if scale > 1:
-            prepared = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-        scale_x, scale_y = (prepared.shape[1] / image.shape[1], prepared.shape[0] / image.shape[0])
-        predict_options = {
-            "use_table_orientation_classify": False,
-            "use_ocr_results_with_table_cells": True,
-            "text_det_limit_side_len": detection_side_limit(prepared.shape),
-            "text_det_limit_type": "max",
-        }
-        results = list(self.model.predict(prepared, **predict_options))
-
-        if not results:
-            raise ValueError("OCR returned no results. Try a clearer image.")
-
-        data = results[0]
-
-        self.validate_table_count(data)
-
-        cells = self.extract_table_structure(data)
-        texts = self.extract_texts(data)
-
-        for item in [*cells, *texts]:
-            bbox = item.bbox
-            item.bbox = BBox(bbox.x_min / scale_x, bbox.y_min / scale_y, bbox.x_max / scale_x, bbox.y_max / scale_y)
-
-        result = self.reconstruct_table(cells, texts)
-
-        if result is None:
-            raise ValueError("No usable table cells were detected. Try a clearer image.")
-
-        result["image_width"], result["image_height"] = int(image.shape[1]), int(image.shape[0])
-        raw = data.json
-
-        if isinstance(raw, str):
-            raw = json.loads(raw)
-
-        raw = {"ocr_scale_x": scale_x, "ocr_scale_y": scale_y, "model_result": raw}
-
-        return raw, result
 
     def detect_document(self, image, native_texts=None):
         """Return (raw output, page) with all text and detected tables in source coordinates.
@@ -320,12 +266,6 @@ class TableExtraction:
 
         return raw_result, page_result
 
-    @staticmethod
-    def validate_table_count(data):
-        """Require exactly one table in the legacy single-table path."""
-        if len(data.get("table_res_list", [])) != 1:
-            raise ValueError("The image must contain exactly one detected table.")
-
     def extract_texts(self, data: dict) -> list[TextItem]:
         """Return TextItems, preferring cell OCR when available.
         Preserve texts with unknown scores; reject missing coordinates."""
@@ -388,10 +328,6 @@ class TableExtraction:
     def extract_cells(self, boxes: list) -> list[Cell]:
         """Convert model boxes to cells without assigned grid positions."""
         return [Cell(-1, -1, box_from(box)) for box in boxes]
-
-    def extract_table_structure(self, data: dict) -> list[Cell]:
-        """Get first-table cells for the legacy single-table path."""
-        return self.extract_cells(data["table_res_list"][0].get("cell_box_list", []))
 
     def reconstruct_table(self, cells: list[Cell], texts: list[TextItem]):
         """Assign grid positions and map text; reject overlapping or unusable cells.

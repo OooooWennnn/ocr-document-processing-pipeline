@@ -1,39 +1,39 @@
 """Document uploads, job status, source previews and saved edits."""
 
-import os
 import logging
+import os
 from io import BytesIO
-from PIL import Image, ImageOps, UnidentifiedImageError
 from pathlib import Path
 from uuid import uuid4
 
 import cv2
 import numpy as np
-from fastapi.responses import FileResponse, StreamingResponse
-from starlette.concurrency import run_in_threadpool
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from pydantic import BaseModel, Field, ConfigDict
+from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
+from starlette.concurrency import run_in_threadpool
 
-from src.db.session import get_session
-from src.models.job_model import Job, JobResult, JobStatus
+from src.database import get_session
+from src.models import Job, JobResult, JobStatus
+from src.services.document_input import preview_path, resolve_source_path, validate_pdf
+from src.services.document_storage import delete_upload, is_s3, open_s3_file, preview_location, save_upload, stream_s3_body
 from src.services.result_editing import apply_document_edits, present_document
-from src.tasks.ocr_tasks import process_job
+from celery_app import process_job
 from src.util import now_toronto
-from src.services.document_input import validate_pdf, preview_path, resolve_source_path
-from src.services.document_storage import is_s3, save_upload, delete_upload, preview_location, open_s3_file, stream_s3_body
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 MAX_BYTES = 50 * 1024 * 1024
-
 MAX_PIXELS = 25_000_000
-STORAGE_ROOT = Path(os.getenv("OCR_STORAGE_DIR", str(Path(__file__).resolve().parents[5] / "storage"))).expanduser().resolve()
+STORAGE_ROOT = Path(os.getenv("OCR_STORAGE_DIR", str(Path(__file__).resolve().parents[2] / "storage"))).expanduser().resolve()
 
 
 class CellEdit(BaseModel):
     """A row, column and replacement value for legacy table edits."""
+
     model_config = ConfigDict(extra="forbid")
     row: int = Field(ge=0)
     col: int = Field(ge=0)
@@ -42,6 +42,7 @@ class CellEdit(BaseModel):
 
 class TextEdit(BaseModel):
     """A region ID and replacement text."""
+
     model_config = ConfigDict(extra="forbid")
     id: str = Field(max_length=100)
     value: str = Field(max_length=10000)
@@ -49,6 +50,7 @@ class TextEdit(BaseModel):
 
 class PageRegionEdit(BaseModel):
     """Edits for one page, using a zero-based page index."""
+
     model_config = ConfigDict(extra="forbid")
     page_index: int = Field(ge=0)
     regions: list[TextEdit] = Field(min_length=1, max_length=10000)
@@ -56,6 +58,7 @@ class PageRegionEdit(BaseModel):
 
 class ResultEdit(BaseModel):
     """Validate edit payloads; pages is current, cells/texts support older clients."""
+
     model_config = ConfigDict(extra="forbid")
     page_index: int = Field(default=0, ge=0)
     table_id: str | None = None
@@ -85,6 +88,30 @@ def get_result_or_404(session, job_id):
     return result
 
 
+def read_uploaded_image(content):
+    """PNG/JPEG 바이트를 검증해 방향과 투명도를 보정한 BGR 이미지를 반환한다. 파일은 저장하지 않는다."""
+    if not (content.startswith(b"\x89PNG\r\n\x1a\n") or content.startswith(b"\xff\xd8\xff")):
+        raise HTTPException(415, "Only PNG, JPEG and PDF documents are supported.")
+
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Images must be 10 MB or smaller.")
+
+    try:
+        with Image.open(BytesIO(content)) as source:
+            if source.width * source.height > MAX_PIXELS:
+                raise HTTPException(413, "Reduce the image to 25 million pixels or fewer.")
+
+            source.verify()
+
+        with Image.open(BytesIO(content)) as source:
+            upright = ImageOps.exif_transpose(source).convert("RGBA")
+            normalized = Image.alpha_composite(Image.new("RGBA", upright.size, "white"), upright).convert("RGB")
+
+            return cv2.cvtColor(np.asarray(normalized), cv2.COLOR_RGB2BGR)
+    except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
+        raise HTTPException(422, "The image could not be read.")
+
+
 @router.get("/{job_id}")
 def get_job(job_id: int, session: Session = Depends(get_session)):
     """Return job metadata, status and any error message."""
@@ -111,13 +138,17 @@ def get_image(job_id: int, page_index: int = 0, session: Session = Depends(get_s
             logger.exception("Could not read the S3 preview for job %s", job_id)
             raise HTTPException(503, "Document storage is unavailable. Please try again shortly.")
 
-        return StreamingResponse(stream_s3_body(stored["Body"]), media_type="image/png", headers={"Cache-Control": "private, no-store", "Content-Length": str(stored["ContentLength"])})
+        headers = {
+            "Cache-Control": "private, no-store",
+            "Content-Length": str(stored["ContentLength"]),
+        }
 
-    source = resolve_source_path(job.file_path) if job.file_path else Path("")
-    path = source
+        return StreamingResponse(stream_s3_body(stored["Body"]), media_type="image/png", headers=headers)
+
+    path = resolve_source_path(job.file_path) if job.file_path else Path("")
 
     if job.file_path and job.file_type == "application/pdf":
-        path = preview_path(source, page_index)
+        path = preview_path(path, page_index)
 
     if not path.is_file():
         raise HTTPException(404, "Page preview is not available yet.")
@@ -129,6 +160,7 @@ def get_image(job_id: int, page_index: int = 0, session: Session = Depends(get_s
 def get_result(job_id: int, session: Session = Depends(get_session)):
     """Return saved edits before OCR originals, with job status and page progress."""
     job = get_job_or_404(session, job_id)
+
     # 화면에 사용하지 않는 모델 원본(raw_json)은 DB에서 읽지 않는다.
     query = select(JobResult.result_json, JobResult.edited_json).where(JobResult.job_id == job_id).order_by(JobResult.id.desc()).limit(1)
     data = session.exec(query).first()
@@ -138,7 +170,12 @@ def get_result(job_id: int, session: Session = Depends(get_session)):
         saved_result = data.edited_json if data.edited_json is not None else data.result_json
         payload = present_document(saved_result)
 
-    return {**payload, "status": job.status, "message": job.error_message, "page_count": job.page_count or 1}
+    return {
+        **payload,
+        "status": job.status,
+        "message": job.error_message,
+        "page_count": job.page_count or 1,
+    }
 
 
 @router.post("/", status_code=201)
@@ -164,25 +201,7 @@ async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
         except ValueError as exc:
             raise HTTPException(422, str(exc))
     else:
-        if not (content.startswith(b"\x89PNG\r\n\x1a\n") or content.startswith(b"\xff\xd8\xff")):
-            raise HTTPException(415, "Only PNG, JPEG and PDF documents are supported.")
-
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(413, "Images must be 10 MB or smaller.")
-
-        try:
-            with Image.open(BytesIO(content)) as source:
-                if source.width * source.height > MAX_PIXELS:
-                    raise HTTPException(413, "Reduce the image to 25 million pixels or fewer.")
-
-                source.verify()
-
-            with Image.open(BytesIO(content)) as source:
-                upright = ImageOps.exif_transpose(source).convert("RGBA")
-                normalized = Image.alpha_composite(Image.new("RGBA", upright.size, "white"), upright).convert("RGB")
-                image = cv2.cvtColor(np.asarray(normalized), cv2.COLOR_RGB2BGR)
-        except (UnidentifiedImageError, OSError, SyntaxError, Image.DecompressionBombError):
-            raise HTTPException(422, "The image could not be read.")
+        image = read_uploaded_image(content)
 
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -195,14 +214,7 @@ async def upload_job(file: UploadFile, session: Session = Depends(get_session)):
         content_type = "application/pdf" if is_pdf else "image/png"
         saved_source = await run_in_threadpool(save_upload, destination, content_type)
 
-        job_data = {
-            "original_filename": file.filename or "image",
-            "file_type": "application/pdf" if is_pdf else "image/png",
-            "file_path": saved_source,
-            "page_count": page_count,
-            "status": JobStatus.queued,
-        }
-        job = Job(**job_data)
+        job = Job(original_filename=file.filename or "image", file_type=content_type, file_path=saved_source, page_count=page_count, status=JobStatus.queued)
 
         session.add(job)
         session.commit()
@@ -265,3 +277,21 @@ def update_result(job_id: int, updated_result: ResultEdit, session: Session = De
     session.commit()
 
     return {"status": "done", **present_document(result.edited_json)}
+
+
+api_router = APIRouter()
+
+
+@api_router.get("/")
+async def root():
+    """Return a response from the API root."""
+    return {"Hello": "World"}
+
+
+@api_router.get("/health")
+def health_check():
+    """Legacy placeholder; Docker uses main.py /health."""
+    pass
+
+
+api_router.include_router(router, prefix="/jobs", tags=["jobs"])

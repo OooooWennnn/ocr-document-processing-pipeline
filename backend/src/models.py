@@ -7,7 +7,7 @@ from sqlmodel import SQLModel, Field
 from sqlalchemy import Column
 from sqlalchemy.dialects.postgresql import JSONB
 
-from ..util import now_toronto
+from .util import now_toronto
 
 
 class JobStatus(str, Enum):

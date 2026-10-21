@@ -1,8 +1,9 @@
 """Resolve storage paths and read PDF pages, text and pixel coordinates."""
 
 import os
-from pathlib import Path
 from contextlib import closing
+from pathlib import Path
+
 import pypdfium2 as pdfium
 from PIL import Image
 
@@ -67,24 +68,38 @@ def preview_path(source, page_index):
 def pdf_text_tokens(textpage, posconv):
     """PDF 문자 순서와 공백을 유지해 줄 단위 토큰을 반환한다. 멀리 떨어진 필드는 분리한다."""
     tokens = []
-    characters = []
-    boxes = []
-    line_break = False
-    previous_font = None
+    line_characters = []
+    character_boxes = []
+    has_line_break = False
+    previous_font_box = None
 
     def finish_line():
         """모은 글자와 좌표를 토큰 하나로 저장하고 다음 줄을 준비한다."""
-        value = "".join(characters).strip()
+        value = "".join(line_characters).strip()
 
-        if value and boxes:
-            left, bottom = min(box[0] for box in boxes), min(box[1] for box in boxes)
-            right, top = max(box[2] for box in boxes), max(box[3] for box in boxes)
+        if value and character_boxes:
+            left = min(box[0] for box in character_boxes)
+            bottom = min(box[1] for box in character_boxes)
+            right = max(box[2] for box in character_boxes)
+            top = max(box[3] for box in character_boxes)
             corners = [posconv.to_bitmap(x, y) for x, y in [(left, bottom), (left, top), (right, bottom), (right, top)]]
-            bbox = {"x_min": min(point[0] for point in corners), "y_min": min(point[1] for point in corners), "x_max": max(point[0] for point in corners), "y_max": max(point[1] for point in corners)}
-            tokens.append({"value": value, "original_value": value, "score": None, "source": "pdf_text", "bbox": bbox})
+            bbox = {
+                "x_min": min(point[0] for point in corners),
+                "y_min": min(point[1] for point in corners),
+                "x_max": max(point[0] for point in corners),
+                "y_max": max(point[1] for point in corners),
+            }
+            token = {
+                "value": value,
+                "original_value": value,
+                "score": None,
+                "source": "pdf_text",
+                "bbox": bbox,
+            }
+            tokens.append(token)
 
-        characters.clear()
-        boxes.clear()
+        line_characters.clear()
+        character_boxes.clear()
 
     for index in range(textpage.count_chars()):
         codepoint = pdfium.raw.FPDFText_GetUnicode(textpage, index)
@@ -96,7 +111,7 @@ def pdf_text_tokens(textpage, posconv):
 
         if character in "\r\n":
             # PDFium이 같은 줄의 글자 사이에도 줄바꿈을 삽입할 수 있어 좌표로 확인한다.
-            line_break = True
+            has_line_break = True
             continue
 
         if character == "\t":
@@ -104,8 +119,8 @@ def pdf_text_tokens(textpage, posconv):
             continue
 
         if character.isspace():
-            if characters:
-                characters.append(character)
+            if line_characters:
+                line_characters.append(character)
 
             continue
 
@@ -116,24 +131,25 @@ def pdf_text_tokens(textpage, posconv):
 
         font_box = textpage.get_charbox(index, loose=True)
 
-        if boxes:
-            previous = boxes[-1]
-            line_bottom, line_top = min(box[1] for box in boxes), max(box[3] for box in boxes)
+        if character_boxes:
+            previous_box = character_boxes[-1]
+            line_bottom = min(box[1] for box in character_boxes)
+            line_top = max(box[3] for box in character_boxes)
             line_height = line_top - line_bottom
             height = top - bottom
-            font_height = min(previous_font[3] - previous_font[1], font_box[3] - font_box[1])
-            overlap = min(previous_font[3], font_box[3]) - max(previous_font[1], font_box[1])
-            gap = left - previous[2]
+            font_height = min(previous_font_box[3] - previous_font_box[1], font_box[3] - font_box[1])
+            overlap = min(previous_font_box[3], font_box[3]) - max(previous_font_box[1], font_box[1])
+            gap = left - previous_box[2]
 
-            if overlap < font_height * 0.5 or gap > max(height, line_height) * 1.5 or right < previous[0]:
+            if overlap < font_height * 0.5 or gap > max(height, line_height) * 1.5 or right < previous_box[0]:
                 finish_line()
-            elif line_break and gap > max(height, line_height) * 0.25 and not characters[-1].isspace():
-                characters.append(" ")
+            elif has_line_break and gap > max(height, line_height) * 0.25 and not line_characters[-1].isspace():
+                line_characters.append(" ")
 
-        characters.append(character)
-        boxes.append((left, bottom, right, top))
-        line_break = False
-        previous_font = font_box
+        line_characters.append(character)
+        character_boxes.append((left, bottom, right, top))
+        has_line_break = False
+        previous_font_box = font_box
 
     finish_line()
 

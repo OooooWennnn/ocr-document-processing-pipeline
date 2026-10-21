@@ -1,8 +1,11 @@
 *
-!Dockerfile
-!requirements.docker.txt
+!Dockerfile.api
+!Dockerfile.worker
+!requirements.txt
 !requirements.ocr.txt
 !main.py
+!celery_app.py
+!benchmark.py
 !src/
 !src/**
 !tests/

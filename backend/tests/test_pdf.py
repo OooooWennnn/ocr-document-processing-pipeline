@@ -1,12 +1,19 @@
-"""PDF 문자 분할과 OCR 병합에서 글자 중복·누락이 생기지 않는지 확인한다."""
+"""PDF 문자 추출·OCR 병합·저장 경로 호환성을 검증한다."""
 
+import os
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-import test_api_flow
+import numpy as np
+
+import test_api
 from src.services import document_input
-from src.tasks.ocr_tasks import merge_native_text
+from src.services.document_input import resolve_source_path
+from src.services.native_pdf_ocr import use_native_text
+from src.services.document_job import merge_native_text
 
 
 class PdfTextTests(unittest.TestCase):
@@ -81,5 +88,48 @@ class PdfTextTests(unittest.TestCase):
                 self.assertEqual(any(token.get("source") == "ocr" for token in page["texts"]), retained)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class NativePdfTests(unittest.TestCase):
+    def test_embedded_text_skips_recognition_serializes_and_restores_pipeline(self):
+        original = types.SimpleNamespace(text_rec_model=object())
+        layout = types.SimpleNamespace(general_ocr_pipeline=original)
+        model = types.SimpleNamespace(paddlex_pipeline=types.SimpleNamespace(_pipeline=layout))
+        tokens = [{"value": "Packing List", "bbox": {"x_min": 10, "y_min": 20, "x_max": 110, "y_max": 40}}]
+
+        with use_native_text(model, tokens, 2, 2):
+            proxy = layout.general_ocr_pipeline
+
+            self.assertIs(proxy.text_rec_model, original.text_rec_model)
+
+            result = list(proxy([np.zeros((100, 300, 3), dtype=np.uint8)]))[0]
+
+            self.assertEqual(result["rec_texts"], ["Packing List"])
+            self.assertEqual(result["rec_boxes"].tolist(), [[20, 40, 220, 80]])
+            self.assertEqual(result.json["res"]["rec_texts"], ["Packing List"])
+
+        self.assertIs(layout.general_ocr_pipeline, original)
+
+        with self.assertRaises(ValueError):
+            with use_native_text(model, tokens, 1, 1):
+                raise ValueError("fail")
+
+        self.assertIs(layout.general_ocr_pipeline, original)
+
+
+class ContainerPathTests(unittest.TestCase):
+    def test_old_storage_path_maps_without_database_change(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"OCR_STORAGE_DIR": root, "OCR_STORAGE_LEGACY_ROOT": "/old/project/storage"}):
+            source = "/old/project/storage/uploads/example.png"
+
+            self.assertEqual(resolve_source_path(source), Path(root) / "uploads/example.png")
+
+            unrelated = "/other/project/example.png"
+
+            self.assertEqual(resolve_source_path(unrelated), Path(unrelated))
+
+            traversal = "/old/project/storage/../outside.png"
+
+            self.assertEqual(resolve_source_path(traversal), Path(traversal))
+
+    def test_existing_file_is_used_as_is(self):
+        with tempfile.NamedTemporaryFile() as source, patch.dict(os.environ, {"OCR_STORAGE_DIR": "/app/storage", "OCR_STORAGE_LEGACY_ROOT": "/old/project/storage"}):
+            self.assertEqual(resolve_source_path(source.name), Path(source.name))

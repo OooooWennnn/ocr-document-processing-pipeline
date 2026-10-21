@@ -84,8 +84,10 @@ the project root:
 cp .env.example .env
 ```
 
-Set `POSTGRES_PASSWORD` in `.env` to your own local password, replacing `change-me`.
-If `.env` already exists, edit it instead of copying the template over it. Then run:
+Replace `change-me` in `.env` with your local database password. The template's
+`DATABASE_URL` uses that password. For Supabase, replace the entire URL with your
+project's connection string instead. If `.env` already exists, edit it instead of
+copying the template over it. Then run:
 
 ```sh
 docker compose up -d --build
@@ -120,13 +122,14 @@ job selection.
 
 ## Configuration
 
-Compose requires `POSTGRES_PASSWORD`; the other settings have local defaults.
-Keep the real password in the root `.env`, which Git ignores. The committed
-root `.env.example` is the only configuration template and contains a placeholder.
-Compose reports an error if no password is supplied. The root `.env` is the
-only local configuration file; do not create `backend/.env` or `frontend/.env`.
-It is excluded from Git and image builds. Compose builds the container database
-and Redis addresses, passes settings to the API and worker, and supplies
+Compose requires `DATABASE_URL` and `POSTGRES_PASSWORD`. The API and worker both
+use `DATABASE_URL`; `POSTGRES_PASSWORD` configures the local `db` service. Keep
+real credentials in the root `.env`, which Git and image builds exclude.
+Do not create separate `backend/.env` or `frontend/.env` files.
+
+The template contains only database and optional S3 settings. OCR limits, worker
+settings and local ports already have defaults in `docker-compose.yml`. Add an
+override to `.env` only when you need to change one. Compose supplies
 `NEXT_PUBLIC_API_URL` when building the frontend.
 
 For an existing database volume, use its current password. Changing `.env` alone
@@ -134,6 +137,7 @@ does not change the database user's password.
 
 | Setting                          | Default                 | Purpose                                                                   |
 | -------------------------------- | ----------------------- | ------------------------------------------------------------------------- |
+| `DATABASE_URL`                   | Required                | PostgreSQL connection string shared by the API and worker                 |
 | `POSTGRES_PASSWORD`              | Required                | Local database password; replace the template placeholder                 |
 | `FRONTEND_PORT` / `BACKEND_PORT` | `3000` / `8000`         | Browser-facing ports                                                      |
 | `POSTGRES_PORT` / `REDIS_PORT`   | `5432` / `63797`        | Local database and queue ports                                            |
@@ -171,8 +175,9 @@ and commands for comparing the detectors on the same documents.
    bucket, and creates a `Job` row in PostgreSQL.
 2. It sends the job ID to Redis and returns immediately. The browser polls for
    progress; the upload response does not mean OCR has finished.
-3. The Celery worker reads the file and processes its pages in order. It reuses
-   one OCR model in its child process.
+3. The Celery task passes the job ID to `document_job.process_job`, which reads
+   the file and processes its pages in order. It reuses one OCR model in the
+   worker's child process.
 4. Each page is converted into text regions and table cells with coordinates.
    Clear table rules can repair cell geometry, and uncertain text matches are
    left available for review rather than forced into a cell.
@@ -194,22 +199,35 @@ or hits its hard timeout, the parent tries to record the job as failed.
 ```text
 backend/
   main.py                   FastAPI app and database initialization
-  src/api/v1/endpoints/     Upload, result, preview and edit endpoints
-  src/models/               PostgreSQL table definitions
-  src/core/                 Celery configuration
+  celery_app.py             Celery configuration, tasks, warmup and interruption handling
+  Dockerfile.api            API container image
+  Dockerfile.worker         Celery worker container image
+  requirements.txt          API dependencies and shared version constraints
+  requirements.ocr.txt      Additional OCR dependencies
+  benchmark.py              Optional OCR performance measurements
+  src/api.py                Upload, result, preview and edit endpoints
+  src/database.py           Database connection and request sessions
+  src/models.py             PostgreSQL table definitions
+  src/schemas.py            Internal OCR data types
+  src/services/document_job.py  Model reuse, document processing and result storage
   src/services/             Document input, OCR, geometry, mapping and edits
-  src/tasks/                Model reuse, job execution and interruption handling
-  tests/                    Automated checks
+  tests/                    API, document, PDF, table and worker checks
 frontend/
   app/                      Pages and styles
-  components/ocr/           Upload and document editor
+  components/               Upload, document editor and query provider
   hooks/                    Upload state and result polling
   lib/                      API types, requests and exports
+docs/
+  aws-deployment.md          S3 and EC2 deployment instructions
+  performance.md            Performance changes and measurements
+  benchmarks/               Shareable measurement summaries
+  images/                   README screenshots
+storage/                    Local uploads, previews and raw benchmarks (not committed)
 docker-compose.yml          Services, storage and optional separate worker host
 .env.example                Compose configuration template
 ```
 
-`requirements.docker.txt` defines the API dependencies. The worker adds
+`requirements.txt` defines the API dependencies. The worker adds
 `requirements.ocr.txt` and CPU PaddlePaddle. The current OCR versions are
 PaddleOCR 3.4.0, PaddleX 3.4.1 and PaddlePaddle 3.3.0. Small compatibility adapters
 in `services/` depend on these versions, so check them when upgrading.

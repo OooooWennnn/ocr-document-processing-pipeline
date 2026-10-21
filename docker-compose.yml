@@ -7,18 +7,19 @@ x-backend-environment: &backend-environment
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}}
   OCR_S3_BUCKET: ${OCR_S3_BUCKET:-}
   AWS_REGION: ${AWS_REGION:-}
+
   OCR_LANGUAGE: ${OCR_LANGUAGE:-korean}
   OCR_DETECTION_MODEL: ${OCR_DETECTION_MODEL:-PP-OCRv5_mobile_det}
   OCR_DETECTION_SIZE: ${OCR_DETECTION_SIZE:-2048}
+  OCR_DETECTION_MAX_PIXELS: ${OCR_DETECTION_MAX_PIXELS:-1000000}
   OCR_UPSCALE_TARGET: ${OCR_UPSCALE_TARGET:-1600}
   OCR_REFINE_MAX_CROPS: ${OCR_REFINE_MAX_CROPS:-64}
-  OCR_DETECTION_MAX_PIXELS: ${OCR_DETECTION_MAX_PIXELS:-1000000}
-  OCR_TASK_TIME_LIMIT: ${OCR_TASK_TIME_LIMIT:-5400}
   OCR_RECOGNITION_BATCH_SIZE: ${OCR_RECOGNITION_BATCH_SIZE:-4}
-  PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
   OCR_CPU_THREADS: ${OCR_CPU_THREADS:-4}
   OCR_WARMUP: ${OCR_WARMUP:-1}
   OCR_WORKER_MAX_TASKS_PER_CHILD: ${OCR_WORKER_MAX_TASKS_PER_CHILD:-5}
+  OCR_TASK_TIME_LIMIT: ${OCR_TASK_TIME_LIMIT:-5400}
+  PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
 
 services:
   db:
@@ -55,6 +56,7 @@ services:
   backend:
     build:
       context: ./backend
+      dockerfile: Dockerfile.api
       target: api
     environment: *backend-environment
     ports:
@@ -62,16 +64,9 @@ services:
     volumes:
       - ${OCR_STORAGE_HOST_DIR:-./storage}:/app/storage
     depends_on:
-      redis:
-        condition: service_healthy
+      redis: {condition: service_healthy}
     healthcheck:
-      test:
-        [
-          CMD,
-          python,
-          -c,
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
-        ]
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -81,6 +76,7 @@ services:
   worker:
     build:
       context: ./backend
+      dockerfile: Dockerfile.worker
       target: worker
     environment:
       <<: *backend-environment
@@ -94,16 +90,10 @@ services:
       - paddle_models:/root/.paddlex
       - model_download_cache:/root/.cache
     depends_on:
-      backend:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      backend: {condition: service_healthy}
+      redis: {condition: service_healthy}
     healthcheck:
-      test:
-        [
-          CMD-SHELL,
-          'celery -A src.core.celery_app:celery_app inspect ping --destination="ocr@$$HOSTNAME" --timeout=5',
-        ]
+      test: [CMD-SHELL, 'celery -A celery_app:celery_app inspect ping --destination="ocr@$$HOSTNAME" --timeout=5']
       interval: 30s
       timeout: 15s
       retries: 3
@@ -119,16 +109,9 @@ services:
     ports:
       - "${FRONTEND_BIND_IP:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     depends_on:
-      backend:
-        condition: service_healthy
+      backend: {condition: service_healthy}
     healthcheck:
-      test:
-        [
-          CMD,
-          node,
-          -e,
-          "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
-        ]
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 5

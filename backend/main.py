@@ -1,13 +1,15 @@
 """FastAPI setup, database initialization and health checks."""
 
 import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.db.engine import engine
 from sqlmodel import SQLModel
-import src.models.job_model
 
-from src.api.v1.api import api_router
+from src.database import engine
+import src.models
+
+from src.api import api_router
 
 app = FastAPI()
 
